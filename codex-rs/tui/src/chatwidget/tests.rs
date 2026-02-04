@@ -895,6 +895,7 @@ async fn make_chatwidget_manual(
         feedback_audience: FeedbackAudience::External,
         current_rollout_path: None,
         external_editor_state: ExternalEditorState::Closed,
+        session_stats: crate::session_stats::SessionStats::new(),
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)

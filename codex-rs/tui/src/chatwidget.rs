@@ -580,6 +580,8 @@ pub(crate) struct ChatWidget {
     // Current session rollout path (if known)
     current_rollout_path: Option<PathBuf>,
     external_editor_state: ExternalEditorState,
+    // Session statistics for /stats command
+    session_stats: crate::session_stats::SessionStats,
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -1039,6 +1041,10 @@ impl ChatWidget {
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
         self.request_redraw();
+
+        // Track turn start and model wait time
+        self.session_stats.start_turn();
+        self.session_stats.start_model_request();
     }
 
     fn on_task_complete(&mut self, last_agent_message: Option<String>, from_replay: bool) {
@@ -1074,6 +1080,15 @@ impl ChatWidget {
         self.unified_exec_wait_streak = None;
         self.clear_unified_exec_processes();
         self.request_redraw();
+
+        // End model wait tracking for this turn
+        self.session_stats.end_model_request();
+
+        // Record token usage for this turn if available
+        if let Some(ref info) = self.token_info {
+            self.session_stats
+                .record_turn_tokens(&info.last_token_usage);
+        }
 
         if !from_replay && self.queued_user_messages.is_empty() {
             self.maybe_prompt_plan_implementation();
@@ -1526,6 +1541,11 @@ impl ChatWidget {
 
     fn on_exec_command_begin(&mut self, ev: ExecCommandBeginEvent) {
         self.flush_answer_stream_with_separator();
+
+        // Track tool execution start time
+        self.session_stats.end_model_request();
+        self.session_stats.start_tool_execution();
+
         if is_unified_exec_source(ev.source) {
             self.track_unified_exec_process_begin(&ev);
             if !is_standard_tool_call(&ev.parsed_cmd) {
@@ -1605,6 +1625,11 @@ impl ChatWidget {
     }
 
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
+        // Track file modifications in session stats
+        for path in event.changes.keys() {
+            self.session_stats.record_file_modified(path.clone());
+        }
+
         self.add_to_history(history_cell::new_patch_event(
             event.changes,
             &self.config.cwd,
@@ -1726,6 +1751,10 @@ impl ChatWidget {
     }
 
     fn on_mcp_tool_call_begin(&mut self, ev: McpToolCallBeginEvent) {
+        // Track tool execution start time
+        self.session_stats.end_model_request();
+        self.session_stats.start_tool_execution();
+
         let ev2 = ev.clone();
         self.defer_or_handle(|q| q.push_mcp_begin(ev), |s| s.handle_mcp_begin_now(ev2));
     }
@@ -2023,6 +2052,15 @@ impl ChatWidget {
         }
         // Mark that actual work was done (command executed)
         self.had_work_activity = true;
+
+        // Track command in session stats
+        let command_str = ev.command.join(" ");
+        self.session_stats
+            .record_command(command_str, ev.exit_code, ev.duration);
+
+        // End tool execution timing and resume model wait tracking
+        self.session_stats.end_tool_execution();
+        self.session_stats.start_model_request();
     }
 
     pub(crate) fn handle_patch_apply_end_now(
@@ -2185,6 +2223,9 @@ impl ChatWidget {
             result,
         } = ev;
 
+        // Track file access before invocation is moved
+        self.track_file_access_from_mcp(&invocation);
+
         let extra_cell = match self
             .active_cell
             .as_mut()
@@ -2210,6 +2251,36 @@ impl ChatWidget {
         }
         // Mark that actual work was done (MCP tool call)
         self.had_work_activity = true;
+
+        // End tool execution timing and resume model wait tracking
+        self.session_stats.end_tool_execution();
+        self.session_stats.start_model_request();
+    }
+
+    fn track_file_access_from_mcp(&mut self, invocation: &codex_core::protocol::McpInvocation) {
+        let tool_name = &invocation.tool;
+        let Some(args) = &invocation.arguments else {
+            return;
+        };
+
+        match tool_name.as_str() {
+            "read_file" => {
+                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                    self.session_stats.record_file_accessed(PathBuf::from(path));
+                }
+            }
+            "list_dir" => {
+                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                    self.session_stats.record_file_accessed(PathBuf::from(path));
+                }
+            }
+            "grep_files" => {
+                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                    self.session_stats.record_file_accessed(PathBuf::from(path));
+                }
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn new(common: ChatWidgetInit, thread_manager: Arc<ThreadManager>) -> Self {
@@ -2329,6 +2400,7 @@ impl ChatWidget {
             feedback_audience,
             current_rollout_path: None,
             external_editor_state: ExternalEditorState::Closed,
+            session_stats: crate::session_stats::SessionStats::new(),
         };
 
         widget.prefetch_rate_limits();
@@ -2475,6 +2547,7 @@ impl ChatWidget {
             feedback_audience,
             current_rollout_path: None,
             external_editor_state: ExternalEditorState::Closed,
+            session_stats: crate::session_stats::SessionStats::new(),
         };
 
         widget.prefetch_rate_limits();
@@ -2610,6 +2683,7 @@ impl ChatWidget {
             feedback_audience,
             current_rollout_path: None,
             external_editor_state: ExternalEditorState::Closed,
+            session_stats: crate::session_stats::SessionStats::new(),
         };
 
         widget.prefetch_rate_limits();
@@ -3004,6 +3078,9 @@ impl ChatWidget {
             }
             SlashCommand::Status => {
                 self.add_status_output();
+            }
+            SlashCommand::Stats => {
+                self.open_stats_view();
             }
             SlashCommand::Ps => {
                 self.add_ps_output();
@@ -4638,6 +4715,13 @@ impl ChatWidget {
             .collect();
 
         let view = ExperimentalFeaturesView::new(features, self.app_event_tx.clone());
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
+    /// Open the session statistics popup (`/stats`).
+    pub(crate) fn open_stats_view(&mut self) {
+        use crate::bottom_pane::StatsView;
+        let view = StatsView::new(&self.session_stats);
         self.bottom_pane.show_view(Box::new(view));
     }
 

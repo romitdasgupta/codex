@@ -78,9 +78,11 @@ pub mod popup_consts;
 mod queued_user_messages;
 mod scroll_state;
 mod selection_popup_common;
+mod stats_view;
 mod textarea;
 mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
+pub(crate) use stats_view::StatsView;
 
 /// How long the "press again to quit" hint stays visible.
 ///
